@@ -37,11 +37,11 @@ done
 
 say() { printf '\033[1;36m›\033[0m %s\n' "$*"; }
 
-# Over ssh there is no desktop session in the environment; borrow it.
+# Run from outside the session (e.g. over ssh): find the running Hyprland.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 if [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
-  while IFS='=' read -r k v; do
-    case "$k" in HYPRLAND_INSTANCE_SIGNATURE|WAYLAND_DISPLAY|XDG_RUNTIME_DIR) export "$k=$v";; esac
-  done < <(systemctl --user show-environment 2>/dev/null)
+  sig="$(ls -t "$XDG_RUNTIME_DIR/hypr" 2>/dev/null | head -1)"
+  [[ -n "$sig" ]] && export HYPRLAND_INSTANCE_SIGNATURE="$sig"
 fi
 
 keyd_state=skip
