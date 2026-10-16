@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.jamesd7788.appkeys",
+  "name": "appkeys",
+  "version": "1.0.0",
+  "author": "jamesd7788",
+  "description": "Workspaces are apps. Hold caps and press a key to jump to an app; if it isn't running it opens alone on a fresh workspace. caps+shift brings it to you, caps+enter binds whatever is focused. The bar widget swaps workspace numbers for the apps on them and their keys.",
+  "license": "MIT",
+  "homepage": "https://github.com/jamesd7788/appkeys",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "App workspaces",
+    "description": "One button per workspace, labelled with its apps and their caps keys. Click to go there. Needs appkeys' install.sh for the keys.",
+    "category": "Compositor",
+    "allowMultiple": false,
+    "defaultSection": "left",
+    "defaults": {
+      "labels": "Key and name",
+      "maxNameLength": 14
+    },
+    "schema": [
+      {
+        "key": "labels",
+        "type": "enum",
+        "label": "Labels",
+        "options": ["Key and name", "Name", "Key"],
+        "defaultValue": "Key and name"
+      },
+      {
+        "key": "maxNameLength",
+        "type": "integer",
+        "label": "Longest app name",
+        "min": 4,
+        "max": 40,
+        "step": 1,
+        "defaultValue": 14
+      }
+    ]
+  }
+}

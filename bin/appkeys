@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""appkeys: manage the caps + key app table (~/.config/appkeys/keys.tsv).
+
+  appkeys bind <key>   bind the focused window's app to caps+<key> (asks first)
+  appkeys unbind       remove every caps key that points at the focused app
+  appkeys list         print the table
+  appkeys path         print the table's path
+
+The table is plain TSV:  key  name  kind  target  [launch]
+  kind web    target = URL (chromium --app window)
+  kind pwa    target = chromium app id (installed PWA)
+  kind class  target = window class, alternatives split by |
+  kind proc   target = process name running directly in a terminal window
+  kind cmd    target = command to run (no focusing)
+"""
+
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "appkeys"
+KEYS_FILE = CONFIG / "keys.tsv"
+HEADER = "# key\tname\tkind\ttarget\tlaunch (optional)\n"
+
+TERMINALS = {"foot", "alacritty", "kitty", "com.mitchellh.ghostty", "tui.float", "org.omarchy.terminal"}
+SHELLS = {"bash", "zsh", "fish", "sh", "dash", "nu"}
+APP_DIRS = [
+    Path.home() / ".local/share/applications",
+    Path.home() / ".local/share/flatpak/exports/share/applications",
+    Path("/var/lib/flatpak/exports/share/applications"),
+    Path("/usr/share/applications"),
+]
+
+
+def notify(msg):
+    subprocess.run(["notify-send", "-a", "appkeys", "-t", "3000", msg], check=False)
+
+
+def hyprctl_json(*args):
+    return json.loads(subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True).stdout or "{}")
+
+
+# ---- table ------------------------------------------------------------------
+
+PUNCT = "-=[];'#,./\\"
+
+
+def is_comment(line):
+    # "#<tab>..." is a row for the # key, not a comment.
+    return line.startswith("# ") or line.strip() == "#" or not line.strip()
+
+
+def read_table():
+    """Return (lines, entries): raw lines for round-tripping, entries by key."""
+    if not KEYS_FILE.exists():
+        return [HEADER], {}
+    lines = KEYS_FILE.read_text().splitlines(keepends=True)
+    entries = {}
+    for line in lines:
+        if is_comment(line):
+            continue
+        f = line.rstrip("\n").split("\t")
+        if len(f) >= 4:
+            entries[f[0].lower()] = {"name": f[1], "kind": f[2], "target": f[3], "launch": f[4] if len(f) > 4 else ""}
+    return lines, entries
+
+
+def write_table(lines):
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    # Write through a symlink (the table may live in a dotfiles repo).
+    KEYS_FILE.resolve().write_text("".join(lines))
+
+
+def set_key(lines, key, entry):
+    row = "\t".join([key, entry["name"], entry["kind"], entry["target"], entry.get("launch", "")]).rstrip("\t") + "\n"
+    out, done = [], False
+    for line in lines:
+        if not is_comment(line) and line.split("\t", 1)[0].lower() == key:
+            if not done:
+                out.append(row)
+                done = True
+            continue
+        out.append(line)
+    if not done:
+        out.append(row)
+    return out
+
+
+def drop_keys(lines, keys):
+    return [l for l in lines if is_comment(l) or l.split("\t", 1)[0].lower() not in keys]
+
+
+# ---- what is the focused window? --------------------------------------------
+
+def desktop_entries():
+    seen = set()
+    for d in APP_DIRS:
+        if not d.is_dir():
+            continue
+        for p in sorted(d.glob("*.desktop")):
+            if p.name in seen:
+                continue
+            seen.add(p.name)
+            fields, section = {}, None
+            try:
+                for line in p.read_text(errors="replace").splitlines():
+                    if line.startswith("["):
+                        section = line.strip()
+                    elif section == "[Desktop Entry]" and "=" in line:
+                        k, v = line.split("=", 1)
+                        fields.setdefault(k.strip(), v.strip())
+            except OSError:
+                continue
+            if fields.get("Type", "Application") == "Application":
+                yield p.name[:-8], fields
+
+
+def find_desktop(cls):
+    c = cls.lower()
+    by_wmclass = by_id = by_exec = None
+    for stem, f in desktop_entries():
+        if f.get("StartupWMClass", "").lower() == c:
+            by_wmclass = by_wmclass or (stem, f)
+        if stem.lower() == c or stem.lower().split(".")[-1] == c:
+            by_id = by_id or (stem, f)
+        exe = os.path.basename(shlex.split(f.get("Exec", "x"))[0]) if f.get("Exec") else ""
+        if exe.lower() == c:
+            by_exec = by_exec or (stem, f)
+    return by_wmclass or by_id or by_exec
+
+
+def children(pid):
+    try:
+        return Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+    except OSError:
+        return []
+
+
+def comm(pid):
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return ""
+
+
+def cmdline(pid):
+    try:
+        return [a for a in Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0") if a]
+    except OSError:
+        return []
+
+
+def describe(win):
+    """Turn a hyprctl window into a table entry (name, kind, target, launch)."""
+    cls, pid = win.get("class", ""), win.get("pid", 0)
+
+    # chromium --app=URL windows: chrome-<host>_<path with / as _>-<profile>
+    m = re.match(r"^chrome-([a-p]{32})-", cls) or re.match(r"^crx_([a-p]{32})$", cls)
+    if m:
+        app_id = m.group(1)
+        name = next((f.get("Name") for stem, f in desktop_entries() if stem.startswith(f"chrome-{app_id}-")), None)
+        return {"name": name or win.get("initialTitle") or cls, "kind": "pwa", "target": app_id, "launch": ""}
+    m = re.match(r"^chrome-(.+?)__(.*)-[^-]+$", cls)
+    if m:
+        host, rest = m.groups()
+        url = f"https://{host}/" + rest.replace("_", "/")
+        # Omarchy web apps have a desktop entry whose Exec holds the URL.
+        name = next((f.get("Name") for _, f in desktop_entries() if f"://{host}" in f.get("Exec", "")), None)
+        if not name:
+            labels = [l for l in host.split(".")[:-1] if l not in ("www", "web", "app", "m")]
+            name = (labels[-1] if labels else host).capitalize()
+        return {"name": name, "kind": "web", "target": url, "launch": ""}
+
+    if cls.lower() in TERMINALS:
+        for c in children(pid):
+            name = comm(c)
+            if name in SHELLS:
+                continue
+            if name == "herdr":
+                launch = "omarchy-launch-terminal-herdr" if shutil.which("omarchy-launch-terminal-herdr") else "xdg-terminal-exec herdr"
+                return {"name": "Herdr", "kind": "proc", "target": "herdr", "launch": launch}
+            app_id = "--app-id=TUI.float " if cls == "TUI.float" else ""
+            return {"name": name, "kind": "proc", "target": name, "launch": f"xdg-terminal-exec {app_id}-e {shlex.join(cmdline(c))}"}
+        return {"name": "Terminal", "kind": "class", "target": cls, "launch": "xdg-terminal-exec"}
+
+    d = find_desktop(cls) or find_desktop(win.get("initialClass", ""))
+    if d:
+        stem, f = d
+        return {"name": f.get("Name", cls), "kind": "class", "target": cls, "launch": f"uwsm-app -- {stem}.desktop"}
+
+    argv = cmdline(pid)
+    return {"name": cls, "kind": "class", "target": cls, "launch": shlex.join(argv) if argv else ""}
+
+
+def entry_matches(e, desc):
+    return e["kind"] == desc["kind"] and (
+        e["target"].lower() == desc["target"].lower()
+        or (e["kind"] == "class" and desc["target"].lower() in e["target"].lower().split("|"))
+    )
+
+
+# ---- UI ---------------------------------------------------------------------
+
+def confirm(prompt, yes, detail):
+    if shutil.which("omarchy-menu-select"):
+        r = subprocess.run(["omarchy-menu-select", prompt, f"\t{yes}\t{detail}", "\tCancel", "--", "--width", "640"],
+                           capture_output=True, text=True)
+        return r.returncode == 0 and r.stdout.startswith(yes)
+    r = subprocess.run(["walker", "--dmenu", "-p", prompt], input=f"{yes}\nCancel\n", capture_output=True, text=True)
+    return r.stdout.strip() == yes
+
+
+def reload():
+    subprocess.run(["hyprctl", "reload"], capture_output=True, check=False)
+
+
+# ---- commands ---------------------------------------------------------------
+
+def cmd_bind(key):
+    key = key.lower()
+    if not (re.fullmatch(r"[0-9a-z]", key) or (len(key) == 1 and key in PUNCT)) or key in "hjkl":
+        notify(f"caps+{key} can't be bound")
+        return 1
+    win = hyprctl_json("activewindow")
+    if not win.get("class"):
+        notify("no focused window to bind")
+        return 1
+    desc = describe(win)
+    if desc["kind"] == "class" and not desc["launch"]:
+        notify(f"can't work out how to launch {desc['name']}")
+        return 1
+    lines, entries = read_table()
+    old = entries.get(key)
+    if old and entry_matches(old, desc):
+        notify(f"caps+{key} is already {old['name']}")
+        return 0
+    also = [k for k, e in entries.items() if k != key and entry_matches(e, desc)]
+
+    prompt = f"caps+{key.upper()} → {desc['name']}"
+    if old:
+        prompt += f"   (replaces {old['name']})"
+    detail = f"{desc['kind']} {desc['target']}" + (f"  ·  launch: {desc['launch']}" if desc["launch"] else "")
+    if also:
+        detail += "  ·  also on caps+" + ",".join(also)
+    if not confirm(prompt, "Bind", detail):
+        return 1
+    write_table(set_key(lines, key, desc))
+    reload()
+    notify(f"caps+{key} → {desc['name']}")
+    return 0
+
+
+def cmd_unbind():
+    win = hyprctl_json("activewindow")
+    if not win.get("class"):
+        notify("no focused window")
+        return 1
+    desc = describe(win)
+    lines, entries = read_table()
+    keys = sorted(k for k, e in entries.items() if entry_matches(e, desc))
+    if not keys:
+        notify(f"{desc['name']} has no caps key")
+        return 0
+    if not confirm(f"Unbind {desc['name']}?", "Unbind", "caps+" + ", caps+".join(keys)):
+        return 1
+    write_table(drop_keys(lines, set(keys)))
+    reload()
+    notify(f"unbound caps+{', caps+'.join(keys)}")
+    return 0
+
+
+def cmd_list():
+    _, entries = read_table()
+    order = sorted(entries, key=lambda k: (not k.isdigit(), k if k != "0" else ":"))
+    for k in order:
+        e = entries[k]
+        print(f"caps+{k}  {e['name']:<18} {e['kind']:<6} {e['target']}")
+    return 0
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[0] == "bind":
+        return cmd_bind(argv[1])
+    if argv[:1] == ["unbind"]:
+        return cmd_unbind()
+    if argv[:1] == ["list"]:
+        return cmd_list()
+    if argv[:1] == ["path"]:
+        print(KEYS_FILE)
+        return 0
+    if argv[:1] == ["describe"]:  # debug: what would bind produce for the focused window
+        print(json.dumps(describe(hyprctl_json("activewindow")), indent=2))
+        return 0
+    print(__doc__.strip())
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

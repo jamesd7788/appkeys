@@ -1,0 +1,19 @@
+# key	name	kind	target	launch (optional)
+# Starter table: common apps on their first letter. caps+enter rebinds anything;
+# digits and the rest of the letters are free for your own.
+b	Browser	class	chromium	chromium
+c	Claude	web	https://claude.ai/
+d	Discord	class	discord	discord
+e	Email	web	https://mail.google.com/
+f	Files	class	org.gnome.Nautilus	nautilus --new-window
+g	ChatGPT	web	https://chatgpt.com/
+i	Messages	web	https://messages.google.com/web/conversations
+m	Music	class	spotify	spotify
+n	Notion	web	https://www.notion.so/
+o	Obsidian	class	obsidian	obsidian
+s	Slack	class	slack	slack
+t	Terminal	class	Alacritty|foot|kitty|com.mitchellh.ghostty	xdg-terminal-exec
+v	VS Code	class	code|code-oss|code-url-handler	code
+w	WhatsApp	web	https://web.whatsapp.com/
+x	X	web	https://x.com/
+y	YouTube	web	https://youtube.com/
